@@ -4,14 +4,19 @@
 /// The `userid` is always represented by `UserId`,
 /// while the `payload` can be any of the types of `MapPayload`.
 ///
-/// Be aware that the content of fields is not strictly specified:
+/// The type of "string-like" fields is not strictly specified:
 /// XRootD specifies them as `char[]`, and this module similarly
-/// represents them as arbitrary `Vec<u8>`.
+/// represents them as arbitrary `Vec<u8>`. They may-or-may-not
+/// contain ASCII data.
 ///
 /// See https://xrootd.slac.stanford.edu/doc/dev44/xrd_monitoring.htm#_Toc449036990
+use std::str;
+use std::str::FromStr;
+
 type Bytes = Vec<u8>;
 type BytesSlice = [u8];
 
+/// Find the index in ``bytes`` for the substring ``at``
 fn index(bytes: &BytesSlice, at: &BytesSlice) -> Option<usize> {
     bytes.windows(at.len()).position(|window| at == window)
 }
@@ -36,6 +41,11 @@ fn get_cgi(bytes: &BytesSlice, key: &BytesSlice) -> Option<Bytes> {
     }
 }
 
+fn parse<T: str::FromStr>(bytes: &BytesSlice) -> Option<T> {
+    str::from_utf8(bytes).ok()?.parse::<T>().ok()
+}
+
+// TODO: Switch back to Result<S, E> to propagate failure reasons
 trait DigestMap: Sized {
     fn from_bytes(data: &BytesSlice) -> Option<Self>;
 }
@@ -113,52 +123,6 @@ impl DigestMap for Path {
 #[derive(Debug)]
 struct AppInfo(Bytes);
 
-impl DigestMap for AppInfo {
-    fn from_bytes(data: &BytesSlice) -> Option<Self> {
-        Some(Self((*data).to_vec()))
-    }
-}
-
-#[derive(Debug)]
-struct PrgInfo {
-    /// The logical or physical name of the file that was purged.
-    xfn: Bytes,
-    /// The Unix seconds, as returned by time(), when the record was produced.
-    tod: Bytes,
-    /// The size of the purged file in bytes.
-    sz: Bytes,
-    /// The file's access time in Unix seconds.
-    at: Bytes,
-    /// The file's creation time in Unix seconds.
-    ct: Bytes,
-    /// The file's modification time in Unix seconds.
-    mt: Bytes,
-    /// The char 'l' if xfn is a logical file name (LFN) or 'p' if it is a physical file name (PFN).
-    /// Normally should be 'l' and indicates an error in name resolution otherwise.
-    fnt: u8,
-}
-
-impl DigestMap for PrgInfo {
-    /// Parse raw data as `xfn\n&tod=tod&sz=bytes&at=at&ct=ct&mt=mt&fn=x`
-    fn from_bytes(data: &BytesSlice) -> Option<Self> {
-        let (xfn, cgi) = partition(data, b"\n")?;
-        if let Some(fn_type) = get_cgi(&cgi, b"fn")?.get(0) {
-            Some(Self {
-                xfn,
-                tod: get_cgi(&cgi, b"tod")?,
-                sz: get_cgi(&cgi, b"sz")?,
-                at: get_cgi(&cgi, b"at")?,
-                ct: get_cgi(&cgi, b"ct")?,
-                mt: get_cgi(&cgi, b"mt")?,
-                fnt: *fn_type,
-            })
-        }
-        else {
-            None
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct AuthInfo {
     /// The authentication protocol name used to authenticate the client.
@@ -180,7 +144,7 @@ pub struct AuthInfo {
     /// The contents of the XRD_MONINFO client-side environmental variable.
     moninfo: Option<Bytes>,
     /// The client's network mode: '4' for IPv4 and '6' for IPv6.
-        ipv: Option<u8>,
+    ipv: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -192,6 +156,7 @@ pub enum MaybeAuthInfo {
 impl DigestMap for MaybeAuthInfo {
     /// Parse raw data as `&p=ap&n=[dn]&h=[hn]&o=[on]&r=[rn]&g=[gn]&m=[info]&x=[xeqname]&y=[minfo]&I={4|6}`
     fn from_bytes(data: &BytesSlice) -> Option<Self> {
+        // helper to parse empty fields as None
         fn empty_none(c: Option<Bytes>) -> Option<Bytes> {
             c.and_then(|v| if v.is_empty() {None} else {Some(v)})
         }
@@ -210,6 +175,137 @@ impl DigestMap for MaybeAuthInfo {
             moninfo: empty_none(get_cgi(&data, b"y")),
             ipv: empty_none(get_cgi(&data, b"I")).map(|v| v[0]),
         }))
+    }
+}
+
+impl DigestMap for AppInfo {
+    fn from_bytes(data: &BytesSlice) -> Option<Self> {
+        Some(Self((*data).to_vec()))
+    }
+}
+
+// FRM monitor maps
+
+#[derive(Debug, PartialEq)]
+#[repr(u8)]
+enum FileNameType {
+    /// Unknown operation, this usually indicates a logic error.
+    Logical = b'l',
+    /// File was copied into the server by client request.
+    Physical = b'p',
+}
+
+impl FromStr for FileNameType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "l" => Ok(Self::Logical),
+            "p" => Ok(Self::Physical),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PrgInfo {
+    /// The logical or physical name of the file that was purged.
+    xfn: Bytes,
+    /// The Unix seconds, as returned by time(), when the record was produced.
+    tod: i64,
+    /// The size of the purged file in bytes.
+    sz: i64,
+    /// The file's access time in Unix seconds.
+    at: i64,
+    /// The file's creation time in Unix seconds.
+    ct: i64,
+    /// The file's modification time in Unix seconds.
+    mt: i64,
+    /// Whether `xfn` is a logical or physical name.
+    /// Normally should be logical and indicates an error in name resolution otherwise.
+    fnt: FileNameType,
+}
+
+impl DigestMap for PrgInfo {
+    /// Parse raw data as `xfn\n&tod=tod&sz=bytes&at=at&ct=ct&mt=mt&fn=x`
+    fn from_bytes(data: &BytesSlice) -> Option<Self> {
+        let (xfn, cgi) = partition(data, b"\n")?;
+        Some(Self {
+            xfn,
+            tod: parse(&get_cgi(&cgi, b"tod")?)?,
+            sz: parse(&get_cgi(&cgi, b"sz")?)?,
+            at: parse(&get_cgi(&cgi, b"at")?)?,
+            ct: parse(&get_cgi(&cgi, b"ct")?)?,
+            mt: parse(&get_cgi(&cgi, b"mt")?)?,
+            fnt: parse(&get_cgi(&cgi, b"fn")?)?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq)]
+#[repr(u8)]
+enum XfrOpt {
+    /// Unknown operation, this usually indicates a logic error.
+    Unknown = b'0',
+    /// File was copied into the server by client request.
+    ClientStage = b'1',
+    /// File was copied out of the server by migration system request.
+    SystemCopy = b'2',
+    /// File was copied-and-deleted out of the server by migration system request.
+    SystemMove = b'3',
+    /// File was copied out of the server by client request.
+    ClientCopy = b'4',
+    /// File was copied-and-deleted out of the server by client request.
+    ClientMove = b'5',
+    /// File was copied into the server by staging system request.
+    SystemStage = b'6',
+}
+
+impl FromStr for XfrOpt {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "0" => Ok(Self::Unknown),
+            "1" => Ok(Self::ClientStage),
+            "2" => Ok(Self::SystemCopy),
+            "3" => Ok(Self::SystemMove),
+            "4" => Ok(Self::ClientCopy),
+            "5" => Ok(Self::ClientMove),
+            "6" => Ok(Self::SystemStage),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct XfrInfo {
+    /// The logical name of the transferred file.
+    xfn: Bytes,
+    /// The Unix seconds, as returned by time(), when the record was produced.
+    tod: i64,
+    /// The time between the start of the request to the time the request completed
+    tm: i64,
+    /// The character operation code for a file transfer event.
+    op: XfrOpt,
+    /// The return code, zero on success.
+    rc: i16,
+    /// optional program monitoring data returned by the transfer command.
+    data: Option<Bytes>,
+}
+
+impl DigestMap for XfrInfo {
+    /// Parse raw data as `lfn\n&tod=tod&sz=bytes&tm=sec&op=op&rc=rc&pd=data`
+    fn from_bytes(data: &BytesSlice) -> Option<Self> {
+        let (xfn, cgi) = partition(data, b"\n")?;
+        Some(Self {
+            xfn,
+            tod: parse(&get_cgi(&cgi, b"tod")?)?,
+            tm: parse(&get_cgi(&cgi, b"sz")?)?,
+            op: parse(&get_cgi(&cgi, b"op")?)?,
+            rc: parse(&get_cgi(&cgi, b"rc")?)?,
+            data: get_cgi(&cgi, b"data"),
+        })
     }
 }
 
@@ -248,15 +344,15 @@ mod tests {
     #[test]
     fn test_read_prg_info() -> Result<(), String> {
         if let Some(prg_info) =
-            PrgInfo::from_bytes(b"xfn\n&tod=tod&sz=bytes&at=at&ct=ct&mt=mt&fn=x")
+            PrgInfo::from_bytes(b"xfn\n&tod=1234&sz=5678&at=0&ct=-15&mt=256&fn=l")
         {
             assert_eq!(prg_info.xfn, b"xfn");
-            assert_eq!(prg_info.tod, b"tod");
-            assert_eq!(prg_info.sz, b"bytes");
-            assert_eq!(prg_info.at, b"at");
-            assert_eq!(prg_info.ct, b"ct");
-            assert_eq!(prg_info.mt, b"mt");
-            assert_eq!(prg_info.fnt, b'x');
+            assert_eq!(prg_info.tod, 1234);
+            assert_eq!(prg_info.sz, 5678);
+            assert_eq!(prg_info.at, 0);
+            assert_eq!(prg_info.ct, -15);
+            assert_eq!(prg_info.mt, 256);
+            assert_eq!(prg_info.fnt, FileNameType::Logical);
             Ok(())
         } else {
             Err(String::from("failed to parse"))
