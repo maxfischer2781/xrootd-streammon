@@ -1,5 +1,5 @@
-use crate::mon_packets::mon_head::PacketPayload;
-use binread::{BinReaderExt, BinResult, Error};
+use crate::mon_packets::mon_head::{PacketPayload, ParseError, XrdParseResult};
+use binread::{BinReaderExt};
 
 pub mod mon_head;
 pub mod mon_map;
@@ -11,16 +11,15 @@ enum Packet {
 
 impl Packet {
     /// Load a packet from binary data provided by a `reader`
-    fn from_data<R: BinReaderExt>(reader: &mut R) -> BinResult<Self> {
+    fn from_data<R: BinReaderExt>(reader: &mut R) -> XrdParseResult<Self> {
         let header: mon_head::Header = reader.read_be()?;
         match header.code {
             mon_head::Code::FileIOTrace => Ok(Self::Trace(
                 mon_trace::XrdXrootdMonBuff::digest_payload(header, reader)?,
             )),
-            _ => Err(Error::AssertFail {
-                pos: 0,
-                message: format!("Unimplemented packet Code {:?}", header.code),
-            }),
+            _ => Err(ParseError::Generic (
+                format!("Unimplemented packet Code {:?}", header.code)
+            )),
         }
     }
 }

@@ -1,4 +1,6 @@
-use binread::{BinRead, BinReaderExt, BinResult};
+use binread::{BinRead, BinReaderExt, Error as BinError};
+
+// Shared Header structure
 
 #[derive(Debug, BinRead, PartialEq)]
 #[repr(u8)]
@@ -35,6 +37,42 @@ pub struct Header {
     pub stod: i32,
 }
 
+impl Header {
+    /// Size of the header in bytes
+    pub const SIZE: usize = 8;
+}
+
+// Parsing facilities
+#[derive(Debug)]
+pub enum ParseError {
+    Generic(
+        /// During what parse operation the issue occurred
+        String,
+    ),
+    BinRead (BinError),
+}
+
+impl From<BinError> for ParseError {
+    fn from(err: BinError) -> Self {
+        Self::BinRead(err)
+    }
+}
+
+impl From<&str> for ParseError {
+    fn from(err: &str) -> Self {
+        Self::Generic(String::from(err))
+    }
+}
+
+impl From<String> for ParseError {
+    fn from(err: String) -> Self {
+        Self::Generic(err)
+    }
+}
+
+/// There was an error parsing raw XrootD data
+pub type XrdParseResult<T> = Result<T, ParseError>;
+
 pub trait PacketPayload: Sized {
-    fn digest_payload<R: BinReaderExt>(header: Header, data: &mut R) -> BinResult<Self>;
+    fn digest_payload<R: BinReaderExt>(header: Header, data: &mut R) -> XrdParseResult<Self>;
 }

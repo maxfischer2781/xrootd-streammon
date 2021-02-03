@@ -1,10 +1,10 @@
-use binread::{BinRead, BinReaderExt, BinResult, Error};
 /// Contents of the XrdXrootdMonTrace struct
 ///
 /// See https://xrootd.slac.stanford.edu/doc/dev44/xrd_monitoring.htm#_Toc449036999
 use std::io::SeekFrom;
+use binread::{BinRead, BinReaderExt, BinResult, Error};
 
-use crate::mon_packets::mon_head::{Code, Header, PacketPayload};
+use crate::mon_packets::mon_head::{Code, Header, PacketPayload, XrdParseResult, ParseError};
 
 /// XROOTD_MON_XXX constants
 #[derive(Debug, BinRead, PartialEq)]
@@ -133,6 +133,8 @@ pub struct Window {
     pub this_start: i32,
 }
 
+// Packet
+
 #[derive(Debug)]
 pub enum Trace {
     AppId(AppId),
@@ -144,6 +146,7 @@ pub enum Trace {
     Window(Window),
 }
 
+/// The trace packet layout
 #[derive(Debug)]
 pub struct XrdXrootdMonBuff {
     pub hdr: Header,
@@ -165,7 +168,7 @@ fn digest_one<R: BinReaderExt>(reader: &mut R) -> BinResult<Trace> {
 }
 
 impl PacketPayload for XrdXrootdMonBuff {
-    fn digest_payload<R: BinReaderExt>(header: Header, reader: &mut R) -> BinResult<Self> {
+    fn digest_payload<R: BinReaderExt>(header: Header, reader: &mut R) -> XrdParseResult<Self> {
         assert_eq!(header.code, Code::FileIOTrace);
         let mut info: Vec<Trace> = vec![];
         loop {
@@ -174,7 +177,7 @@ impl PacketPayload for XrdXrootdMonBuff {
                 // distinguish between error from EOF and error from parsing
                 Err(x) => match x {
                     Error::Io(_) => break,
-                    _ => return Err(x),
+                    _ => return Err(ParseError::from(x)),
                 },
             }
         }

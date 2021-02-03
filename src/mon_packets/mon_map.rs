@@ -12,6 +12,9 @@
 /// See https://xrootd.slac.stanford.edu/doc/dev44/xrd_monitoring.htm#_Toc449036990
 use std::str;
 use std::str::FromStr;
+use binread::{BinReaderExt};
+
+use crate::mon_packets::mon_head::{Code, Header, PacketPayload, XrdParseResult, ParseError};
 
 type Bytes = Vec<u8>;
 type BytesSlice = [u8];
@@ -41,38 +44,47 @@ fn get_cgi(bytes: &BytesSlice, key: &BytesSlice) -> Option<Bytes> {
     }
 }
 
-fn parse<T: str::FromStr>(bytes: &BytesSlice) -> Option<T> {
-    str::from_utf8(bytes).ok()?.parse::<T>().ok()
+fn parse<T: str::FromStr>(bytes: &BytesSlice) -> XrdParseResult<T> {
+    if let Ok(Ok(result)) = str::from_utf8(bytes).map(|s| s.parse()) {
+        Ok(result)
+    }
+    else {
+        Err(ParseError::Generic(format!("Failed to parse {:?}", bytes)))
+    }
 }
 
 // TODO: Switch back to Result<S, E> to propagate failure reasons
 trait DigestMap: Sized {
-    fn from_bytes(data: &BytesSlice) -> Option<Self>;
+    fn from_bytes(data: &BytesSlice) -> XrdParseResult<Self>;
 }
 
 /// Identification of an entity – "user" just means "not this server"
 #[derive(Debug)]
-struct UserId {
+pub struct UserId {
     /// The communication protocol being used by the client (e.g., xroot, http, etc).
-    prot: Bytes,
+    pub prot: Bytes,
     /// The Unix username of the user as reported by the client (i.e. unverified).
-    user: Bytes,
+    pub user: Bytes,
     /// The user's process number that issued the request.
-    pid: Bytes,
+    pub pid: Bytes,
     /// The server's identification processing the connection to `user:pid` at `host`.
-    sid: Bytes,
+    pub sid: Bytes,
     /// The host name, or IP address, where the user's request originated.
-    host: Bytes,
+    pub host: Bytes,
 }
 
 impl DigestMap for UserId {
     /// Parse raw data as `prot/user.pid:sid@host`
-    fn from_bytes(data: &BytesSlice) -> Option<Self> {
-        let (prot, rest) = partition(&data, b"/")?;
-        let (user, rest) = partition(&rest, b".")?;
-        let (pid, rest) = partition(&rest, b":")?;
-        let (sid, host) = partition(&rest, b"@")?;
-        Some(Self {
+    fn from_bytes(data: &BytesSlice) -> XrdParseResult<Self> {
+        let (prot, rest) = partition(&data, b"/").ok_or(
+            "Missing '/' before UserID.prot")?;
+        let (user, rest) = partition(&rest, b".").ok_or(
+            "Missing '.' before UserID.user")?;
+        let (pid, rest) = partition(&rest, b":").ok_or(
+            "Missing ':' before UserID.pid")?;
+        let (sid, host) = partition(&rest, b"@").ok_or(
+            "Missing '@' before UserID.sid")?;
+        Ok(Self {
             prot,
             user,
             pid,
@@ -98,53 +110,58 @@ pub struct SrvInfo {
 
 impl DigestMap for SrvInfo {
     /// Parse raw data as `&pgm=prog&ver=vname&inst=iname&port=pnum&site=sname`
-    fn from_bytes(data: &BytesSlice) -> Option<Self> {
-        Some(Self {
-            pgm: get_cgi(data, b"pgm")?,
-            ver: get_cgi(data, b"ver")?,
-            inst: get_cgi(data, b"inst")?,
-            port: get_cgi(data, b"port")?,
-            site: get_cgi(data, b"site")?,
+    fn from_bytes(data: &BytesSlice) -> XrdParseResult<Self> {
+        Ok(Self {
+            pgm: get_cgi(data, b"pgm").ok_or(
+            "Missing key 'pgm' for SrvInfo")?,
+            ver: get_cgi(data, b"ver").ok_or(
+            "Missing key 'ver' for SrvInfo")?,
+            inst: get_cgi(data, b"inst").ok_or(
+            "Missing key 'inst' for SrvInfo")?,
+            port: get_cgi(data, b"port").ok_or(
+            "Missing key 'port' for SrvInfo")?,
+            site: get_cgi(data, b"site").ok_or(
+            "Missing key 'site' for SrvInfo")?,
         })
     }
 }
 
 /// The full path name of the file being opened.
 #[derive(Debug)]
-struct Path(Bytes);
+pub struct PathInfo(Bytes);
 
-impl DigestMap for Path {
-    fn from_bytes(data: &BytesSlice) -> Option<Self> {
-        Some(Self((*data).to_vec()))
+impl DigestMap for PathInfo {
+    fn from_bytes(data: &BytesSlice) -> XrdParseResult<Self> {
+        Ok(Self((*data).to_vec()))
     }
 }
 
 /// Un-interpreted application supplied information.
 #[derive(Debug)]
-struct AppInfo(Bytes);
+pub struct AppInfo(Bytes);
 
 #[derive(Debug)]
 pub struct AuthInfo {
     /// The authentication protocol name used to authenticate the client.
-    protocol: Bytes,
+    pub protocol: Bytes,
     /// The client's distinguished name as reported by the protocol.
-    name: Option<Bytes>,
+    pub name: Option<Bytes>,
     /// The client's host’s name as reported by the protocol.
-    host: Option<Bytes>,
+    pub host: Option<Bytes>,
     /// The client's organization name as reported by the protocol.
-    organization: Option<Bytes>,
+    pub organization: Option<Bytes>,
     /// The client's role name as reported by the protocol.
-    role: Option<Bytes>,
+    pub role: Option<Bytes>,
     /// The client's group names in a space-separated list.
-    groups: Option<Bytes>,
+    pub groups: Option<Bytes>,
     /// ???
-    m: Option<Bytes>,
+    pub m: Option<Bytes>,
     /// The name of the executable program the client is running with the path removed.
-    executable: Option<Bytes>,
+    pub executable: Option<Bytes>,
     /// The contents of the XRD_MONINFO client-side environmental variable.
-    moninfo: Option<Bytes>,
+    pub moninfo: Option<Bytes>,
     /// The client's network mode: '4' for IPv4 and '6' for IPv6.
-    ipv: Option<u8>,
+    pub ipv: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -155,16 +172,17 @@ pub enum MaybeAuthInfo {
 
 impl DigestMap for MaybeAuthInfo {
     /// Parse raw data as `&p=ap&n=[dn]&h=[hn]&o=[on]&r=[rn]&g=[gn]&m=[info]&x=[xeqname]&y=[minfo]&I={4|6}`
-    fn from_bytes(data: &BytesSlice) -> Option<Self> {
+    fn from_bytes(data: &BytesSlice) -> XrdParseResult<Self> {
         // helper to parse empty fields as None
         fn empty_none(c: Option<Bytes>) -> Option<Bytes> {
             c.and_then(|v| if v.is_empty() {None} else {Some(v)})
         }
         if data.is_empty() {
-            return Some(Self::Unavailable)
+            return Ok(Self::Unavailable)
         }
-        Some(Self::Full(AuthInfo {
-            protocol: get_cgi(&data, b"p")?,
+        Ok(Self::Full(AuthInfo {
+            protocol: get_cgi(&data, b"p").ok_or(
+            "Missing key 'p' for SrvInfo")?,
             name: empty_none(get_cgi(&data, b"n")),
             host: empty_none(get_cgi(&data, b"h")),
             organization: empty_none(get_cgi(&data, b"o")),
@@ -179,16 +197,20 @@ impl DigestMap for MaybeAuthInfo {
 }
 
 impl DigestMap for AppInfo {
-    fn from_bytes(data: &BytesSlice) -> Option<Self> {
-        Some(Self((*data).to_vec()))
+    fn from_bytes(data: &BytesSlice) -> XrdParseResult<Self> {
+        Ok(Self((*data).to_vec()))
     }
 }
 
 // FRM monitor maps
+fn parse_cgi<T: str::FromStr>(bytes: &BytesSlice, key: &BytesSlice) -> XrdParseResult<T> {
+    parse::<T>(&get_cgi(bytes, key).ok_or(
+    format!("Missing key {:?}", key))?)
+}
 
 #[derive(Debug, PartialEq)]
 #[repr(u8)]
-enum FileNameType {
+pub enum FileNameType {
     /// Unknown operation, this usually indicates a logic error.
     Logical = b'l',
     /// File was copied into the server by client request.
@@ -208,43 +230,44 @@ impl FromStr for FileNameType {
 }
 
 #[derive(Debug)]
-struct PrgInfo {
+pub struct PrgInfo {
     /// The logical or physical name of the file that was purged.
-    xfn: Bytes,
+    pub xfn: Bytes,
     /// The Unix seconds, as returned by time(), when the record was produced.
-    tod: i64,
+    pub tod: i64,
     /// The size of the purged file in bytes.
-    sz: i64,
+    pub sz: i64,
     /// The file's access time in Unix seconds.
-    at: i64,
+    pub at: i64,
     /// The file's creation time in Unix seconds.
-    ct: i64,
+    pub ct: i64,
     /// The file's modification time in Unix seconds.
-    mt: i64,
+    pub mt: i64,
     /// Whether `xfn` is a logical or physical name.
     /// Normally should be logical and indicates an error in name resolution otherwise.
-    fnt: FileNameType,
+    pub fnt: FileNameType,
 }
 
 impl DigestMap for PrgInfo {
     /// Parse raw data as `xfn\n&tod=tod&sz=bytes&at=at&ct=ct&mt=mt&fn=x`
-    fn from_bytes(data: &BytesSlice) -> Option<Self> {
-        let (xfn, cgi) = partition(data, b"\n")?;
-        Some(Self {
+    fn from_bytes(data: &BytesSlice) -> XrdParseResult<Self> {
+        let (xfn, cgi) = partition(data, b"\n").ok_or(
+            "Missing newline in PrgInfo")?;
+        Ok(Self {
             xfn,
-            tod: parse(&get_cgi(&cgi, b"tod")?)?,
-            sz: parse(&get_cgi(&cgi, b"sz")?)?,
-            at: parse(&get_cgi(&cgi, b"at")?)?,
-            ct: parse(&get_cgi(&cgi, b"ct")?)?,
-            mt: parse(&get_cgi(&cgi, b"mt")?)?,
-            fnt: parse(&get_cgi(&cgi, b"fn")?)?,
+            tod: parse_cgi(&cgi, b"tod")?,
+            sz: parse_cgi(&cgi, b"sz")?,
+            at: parse_cgi(&cgi, b"at")?,
+            ct: parse_cgi(&cgi, b"ct")?,
+            mt: parse_cgi(&cgi, b"mt")?,
+            fnt: parse_cgi(&cgi, b"fn")?,
         })
     }
 }
 
 #[derive(Debug, PartialEq)]
 #[repr(u8)]
-enum XfrOpt {
+pub enum XfrOpt {
     /// Unknown operation, this usually indicates a logic error.
     Unknown = b'0',
     /// File was copied into the server by client request.
@@ -279,35 +302,90 @@ impl FromStr for XfrOpt {
 }
 
 #[derive(Debug)]
-struct XfrInfo {
+pub struct XfrInfo {
     /// The logical name of the transferred file.
-    xfn: Bytes,
+    pub xfn: Bytes,
     /// The Unix seconds, as returned by time(), when the record was produced.
-    tod: i64,
+    pub tod: i64,
     /// The time between the start of the request to the time the request completed
-    tm: i64,
+    pub tm: i64,
     /// The character operation code for a file transfer event.
-    op: XfrOpt,
+    pub op: XfrOpt,
     /// The return code, zero on success.
-    rc: i16,
+    pub rc: i16,
     /// optional program monitoring data returned by the transfer command.
-    data: Option<Bytes>,
+    pub data: Option<Bytes>,
 }
 
 impl DigestMap for XfrInfo {
     /// Parse raw data as `lfn\n&tod=tod&sz=bytes&tm=sec&op=op&rc=rc&pd=data`
-    fn from_bytes(data: &BytesSlice) -> Option<Self> {
-        let (xfn, cgi) = partition(data, b"\n")?;
-        Some(Self {
+    fn from_bytes(data: &BytesSlice) -> XrdParseResult<Self> {
+        let (xfn, cgi) = partition(data, b"\n").ok_or(
+            "Missing newline in XfrInfo")?;
+        Ok(Self {
             xfn,
-            tod: parse(&get_cgi(&cgi, b"tod")?)?,
-            tm: parse(&get_cgi(&cgi, b"sz")?)?,
-            op: parse(&get_cgi(&cgi, b"op")?)?,
-            rc: parse(&get_cgi(&cgi, b"rc")?)?,
+            tod: parse_cgi(&cgi, b"tod")?,
+            tm: parse_cgi(&cgi, b"sz")?,
+            op: parse_cgi(&cgi, b"op")?,
+            rc: parse_cgi(&cgi, b"rc")?,
             data: get_cgi(&cgi, b"data"),
         })
     }
 }
+
+// Packet
+
+#[derive(Debug)]
+pub enum Info {
+    Srv(SrvInfo),
+    Path(PathInfo),
+    App(AppInfo),
+    Auth(MaybeAuthInfo),
+    Prg(PrgInfo),
+    Xfr(XfrInfo),
+}
+
+/// The map packet layout
+#[derive(Debug)]
+pub struct XrdXrootdMonMap {
+    pub hdr: Header,
+    pub dict_id: u32,
+    pub user: UserId,
+    pub info: Info,
+}
+
+impl PacketPayload for XrdXrootdMonMap {
+    fn digest_payload<R: BinReaderExt>(header: Header, reader: &mut R) -> XrdParseResult<Self> {
+        let dict_id = reader.read_be()?;
+        let payload = reader.read_be::<Bytes>()?;
+        let (user_data, info_data) = match payload.contains(&b'\n') {
+            true => partition(&payload, b"\n").unwrap(),
+            false => (payload, Vec::new()),
+        };
+        assert_eq!(Header::SIZE + user_data.len() + info_data.len(), header.plen as usize);
+        let user = UserId::from_bytes(&user_data)?;
+        let info: Info = match header.code {
+            Code::ServerId => Info::Srv(SrvInfo::from_bytes(&info_data)?),
+            Code::PathDictId => Info::Path(PathInfo::from_bytes(&info_data)?),
+            Code::FileTransfer => Info::Xfr(XfrInfo::from_bytes(&info_data)?),
+            Code::AppDictId => Info::App(AppInfo::from_bytes(&info_data)?),
+            Code::FilePurge => Info::Prg(PrgInfo::from_bytes(&info_data)?),
+            Code::UserDictId => Info::Auth(MaybeAuthInfo::from_bytes(&info_data)?),
+            Code::FileEvent | Code::RedirectEvent | Code::FileIOTrace => {
+                return Err(ParseError::Generic(
+                    format!("Invalid header code for XrdXrootdMonMap: {:?}", header.code)
+                ))
+            }
+        };
+        Ok(XrdXrootdMonMap {
+            hdr: header,
+            dict_id,
+            user,
+            info,
+        })
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -327,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_read_srv_info() -> Result<(), String> {
-        if let Some(srv_info) =
+        if let Ok(srv_info) =
             SrvInfo::from_bytes(b"&pgm=prog&ver=vname&inst=iname&port=pnum&site=sname")
         {
             assert_eq!(srv_info.pgm, b"prog");
@@ -343,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_read_prg_info() -> Result<(), String> {
-        if let Some(prg_info) =
+        if let Ok(prg_info) =
             PrgInfo::from_bytes(b"xfn\n&tod=1234&sz=5678&at=0&ct=-15&mt=256&fn=l")
         {
             assert_eq!(prg_info.xfn, b"xfn");
@@ -361,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_read_auth_info() -> Result<(), String> {
-        if let Some(auth_info) =
+        if let Ok(auth_info) =
             MaybeAuthInfo::from_bytes(b"&p=ap&n=dn&h=hn&o=on&r=rn&g=gn&m=info&x=xeqname&y=minfo&I=4")
         {
             match auth_info {
@@ -378,13 +456,13 @@ mod tests {
 
     #[test]
     fn test_read_auth_info_empty() -> Result<(), String> {
-        if MaybeAuthInfo::from_bytes(b"&n=dn&h=hn&o=on&r=rn&g=gn&m=info&x=xeqname&y=minfo&I=4").is_some() {
+        if MaybeAuthInfo::from_bytes(b"&n=dn&h=hn&o=on&r=rn&g=gn&m=info&x=xeqname&y=minfo&I=4").is_ok() {
             return Err(String::from("parsed malformed auth info"))
         }
         match MaybeAuthInfo::from_bytes(b"") {
-            None => Err(String::from("failed to parse")),
-            Some(MaybeAuthInfo::Unavailable) => Ok(()),
-            Some(MaybeAuthInfo::Full(_)) => Err(String::from("parsed malformed auth info")),
+            Err(err) => Err(format!("failed to parse: {:?}", err)),
+            Ok(MaybeAuthInfo::Unavailable) => Ok(()),
+            Ok(MaybeAuthInfo::Full(_)) => Err(String::from("parsed malformed auth info")),
         }
     }
 }
